@@ -114,10 +114,10 @@ Access from:
 
 ## 🎨 Screenshots
 
-### 📁 File Manager
+### 📊 System Monitor
 ![File Manager](screenshots/file-manager.png?raw=true)
 
-### 📊 System Monitor
+### 📁 File Manager
 ![System Monitor](screenshots/system-monitor.png?raw=true)
 
 ## 🔄 Updates
