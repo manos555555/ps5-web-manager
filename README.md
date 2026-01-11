@@ -115,10 +115,10 @@ Access from:
 ## 🎨 Screenshots
 
 ### 📁 File Manager
-![File Manager](screenshots/file-manager.png)
+![File Manager](screenshots/file-manager.png?raw=true)
 
 ### 📊 System Monitor
-![System Monitor](screenshots/system-monitor.png)
+![System Monitor](screenshots/system-monitor.png?raw=true)
 
 ## 🔄 Updates
 
