@@ -1127,6 +1127,19 @@ void* client_thread(void* arg) {
 }
 
 int main() {
+    // Fork to background so elfldr can load other payloads
+    pid_t pid = fork();
+    if (pid > 0) {
+        // Parent process exits immediately
+        return 0;
+    }
+    if (pid < 0) {
+        // Fork failed, continue anyway
+    }
+    
+    // Child process continues as daemon
+    setsid();
+    
     int server_sock;
     struct sockaddr_in server_addr;
     
