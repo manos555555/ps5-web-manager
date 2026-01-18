@@ -20,9 +20,11 @@
 #include <time.h>
 #include <sys/statvfs.h>
 #include <ifaddrs.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 
 #define HTTP_PORT 8080
-#define BUFFER_SIZE (64 * 1024)
+#define BUFFER_SIZE (1 * 1024 * 1024)
 #define MAX_PATH 2048
 
 // Server statistics (global)
@@ -104,6 +106,27 @@ void send_http_response(int sock, int code, const char *content_type, const char
     }
 }
 
+// File entry structure for sorting
+typedef struct {
+    char name[256];
+    int is_dir;
+    long long size;
+    long mtime;
+} file_entry_t;
+
+// Comparison function for qsort: directories first, then alphabetically
+int compare_entries(const void *a, const void *b) {
+    file_entry_t *fa = (file_entry_t *)a;
+    file_entry_t *fb = (file_entry_t *)b;
+    
+    // Directories come first
+    if (fa->is_dir && !fb->is_dir) return -1;
+    if (!fa->is_dir && fb->is_dir) return 1;
+    
+    // Within same type, sort alphabetically (case-insensitive)
+    return strcasecmp(fa->name, fb->name);
+}
+
 // Get file list as JSON
 void handle_list_files(int sock, const char *path) {
     char decoded_path[MAX_PATH];
@@ -116,18 +139,25 @@ void handle_list_files(int sock, const char *path) {
         return;
     }
     
-    char *json = malloc(1024 * 1024);
-    if (!json) {
+    // First pass: count entries and allocate array
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0) continue;
+        count++;
+    }
+    rewinddir(dir);
+    
+    file_entry_t *entries = malloc(count * sizeof(file_entry_t));
+    if (!entries) {
         closedir(dir);
         const char *error_msg = "{\"error\":\"Memory error\"}";
         send_http_response(sock, 500, "application/json", error_msg, strlen(error_msg));
         return;
     }
     
-    int pos = sprintf(json, "{\"path\":\"%s\",\"files\":[", decoded_path);
-    
-    struct dirent *entry;
-    int first = 1;
+    // Second pass: collect file info
+    int idx = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0) continue;
         
@@ -136,23 +166,45 @@ void handle_list_files(int sock, const char *path) {
         
         struct stat st;
         if (stat(fullpath, &st) == 0) {
-            if (!first) pos += sprintf(json + pos, ",");
-            first = 0;
-            
-            pos += sprintf(json + pos, 
-                "{\"name\":\"%s\",\"type\":\"%s\",\"size\":%lld,\"mtime\":%ld}",
-                entry->d_name,
-                S_ISDIR(st.st_mode) ? "dir" : "file",
-                (long long)st.st_size,
-                (long)st.st_mtime);
+            strncpy(entries[idx].name, entry->d_name, sizeof(entries[idx].name) - 1);
+            entries[idx].name[sizeof(entries[idx].name) - 1] = '\0';
+            entries[idx].is_dir = S_ISDIR(st.st_mode);
+            entries[idx].size = st.st_size;
+            entries[idx].mtime = st.st_mtime;
+            idx++;
         }
+    }
+    closedir(dir);
+    
+    // Sort: directories first, then alphabetically
+    qsort(entries, idx, sizeof(file_entry_t), compare_entries);
+    
+    // Build JSON response
+    char *json = malloc(1024 * 1024);
+    if (!json) {
+        free(entries);
+        const char *error_msg = "{\"error\":\"Memory error\"}";
+        send_http_response(sock, 500, "application/json", error_msg, strlen(error_msg));
+        return;
+    }
+    
+    int pos = sprintf(json, "{\"path\":\"%s\",\"files\":[", decoded_path);
+    
+    for (int i = 0; i < idx; i++) {
+        if (i > 0) pos += sprintf(json + pos, ",");
+        pos += sprintf(json + pos, 
+            "{\"name\":\"%s\",\"type\":\"%s\",\"size\":%lld,\"mtime\":%ld}",
+            entries[i].name,
+            entries[i].is_dir ? "dir" : "file",
+            entries[i].size,
+            entries[i].mtime);
     }
     
     pos += sprintf(json + pos, "]}");
-    closedir(dir);
     
     send_http_response(sock, 200, "application/json", json, pos);
     free(json);
+    free(entries);
 }
 
 // Download file
@@ -169,6 +221,13 @@ void handle_download_file(int sock, const char *path) {
     struct stat st;
     fstat(fd, &st);
     
+    // Set socket options for optimal download performance
+    int no_sigpipe = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    
+    int nopush = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NOPUSH, &nopush, sizeof(nopush));
+    
     char header[1024];
     int header_len = snprintf(header, sizeof(header),
         "HTTP/1.1 200 OK\r\n"
@@ -183,15 +242,47 @@ void handle_download_file(int sock, const char *path) {
     send(sock, header, header_len, 0);
     
     unsigned long long bytes_sent = 0;
+    
+    #ifdef __FreeBSD__
+    // PS5 uses FreeBSD - use sendfile for zero-copy transfer
+    off_t offset = 0;
+    off_t sbytes = 0;
+    int sf_result = sendfile(fd, sock, offset, st.st_size, NULL, &sbytes, 0);
+    bytes_sent = sbytes;
+    
+    if (sf_result == 0 || (sf_result < 0 && errno == EAGAIN)) {
+        // sendfile succeeded
+        nopush = 0;
+        setsockopt(sock, IPPROTO_TCP, TCP_NOPUSH, &nopush, sizeof(nopush));
+        close(fd);
+        total_files_transferred++;
+        total_bytes_transferred += bytes_sent;
+        return;
+    }
+    #endif
+    
+    // Fallback to traditional read/write
     char *buffer = malloc(BUFFER_SIZE);
     if (buffer) {
         ssize_t n;
         while ((n = read(fd, buffer, BUFFER_SIZE)) > 0) {
-            send(sock, buffer, n, 0);
-            bytes_sent += n;
+            ssize_t sent = 0;
+            while (sent < n) {
+                ssize_t s = send(sock, buffer + sent, n - sent, 0);
+                if (s < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (s == 0) break;
+                sent += s;
+            }
+            bytes_sent += sent;
         }
         free(buffer);
     }
+    
+    nopush = 0;
+    setsockopt(sock, IPPROTO_TCP, TCP_NOPUSH, &nopush, sizeof(nopush));
     
     close(fd);
     
@@ -246,19 +337,67 @@ void handle_system_info(int sock) {
         sys_used = sys_total - sys_free;
     }
     
-    // RAM info (estimated - PS5 has 16GB total, 13.5GB available to apps)
-    unsigned long long ram_total = 16ULL * 1024 * 1024 * 1024;  // 16 GB
-    unsigned long long ram_available = 13ULL * 1024 * 1024 * 1024;  // ~13 GB available
-    // Estimate usage based on uptime (rough approximation)
-    unsigned long long ram_used = ram_available * 0.6;  // Assume ~60% usage
-    unsigned long long ram_free = ram_total - ram_used;
+    // RAM info - PS5 specific memory detection
+    unsigned long long ram_total = 16ULL * 1024 * 1024 * 1024;  // PS5 has 16GB
+    unsigned long long ram_free = 0;
+    unsigned long long ram_used = 0;
     
-    // Uptime
-    static time_t start_time = 0;
-    if (start_time == 0) {
-        start_time = time(NULL);
+    // Try multiple methods to get actual RAM usage
+    size_t len = sizeof(ram_total);
+    
+    // Method 1: Try hw.physmem for total
+    if (sysctlbyname("hw.physmem", &ram_total, &len, NULL, 0) != 0) {
+        ram_total = 16ULL * 1024 * 1024 * 1024;
     }
-    time_t uptime_seconds = time(NULL) - start_time;
+    
+    // Method 2: Try to get memory stats
+    unsigned long page_size = 4096;
+    unsigned long free_pages = 0;
+    unsigned long inactive_pages = 0;
+    unsigned long cache_pages = 0;
+    
+    len = sizeof(page_size);
+    sysctlbyname("hw.pagesize", &page_size, &len, NULL, 0);
+    
+    // Get various memory page counts
+    len = sizeof(free_pages);
+    int got_free = (sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &len, NULL, 0) == 0);
+    
+    len = sizeof(inactive_pages);
+    int got_inactive = (sysctlbyname("vm.stats.vm.v_inactive_count", &inactive_pages, &len, NULL, 0) == 0);
+    
+    len = sizeof(cache_pages);
+    int got_cache = (sysctlbyname("vm.stats.vm.v_cache_count", &cache_pages, &len, NULL, 0) == 0);
+    
+    if (got_free || got_inactive || got_cache) {
+        // Calculate available memory (free + inactive + cache)
+        unsigned long available_pages = free_pages + inactive_pages + cache_pages;
+        ram_free = (unsigned long long)available_pages * page_size;
+        ram_used = ram_total - ram_free;
+    } else {
+        // Fallback: Use /proc/meminfo style estimate
+        ram_used = ram_total * 0.6;
+        ram_free = ram_total - ram_used;
+    }
+    
+    // Uptime - Get actual system uptime
+    struct timespec uptime_ts;
+    time_t uptime_seconds = 0;
+    
+    // Try to get system boot time
+    struct timeval boottime;
+    size_t boottime_len = sizeof(boottime);
+    if (sysctlbyname("kern.boottime", &boottime, &boottime_len, NULL, 0) == 0) {
+        uptime_seconds = time(NULL) - boottime.tv_sec;
+    } else {
+        // Fallback: try clock_gettime
+        if (clock_gettime(CLOCK_UPTIME, &uptime_ts) == 0) {
+            uptime_seconds = uptime_ts.tv_sec;
+        } else {
+            uptime_seconds = 0;
+        }
+    }
+    
     int days = uptime_seconds / 86400;
     int hours = (uptime_seconds % 86400) / 3600;
     int minutes = (uptime_seconds % 3600) / 60;
@@ -304,8 +443,8 @@ void handle_system_info(int sock) {
                    ram_total, ram_used, ram_free);
     
     // Uptime
-    pos += sprintf(json + pos, "\"uptime\":{\"seconds\":%ld,\"days\":%d,\"hours\":%d,\"minutes\":%d,\"secs\":%d,\"start_time\":%ld},", 
-                   (long)uptime_seconds, days, hours, minutes, seconds, (long)start_time);
+    pos += sprintf(json + pos, "\"uptime\":{\"seconds\":%ld,\"days\":%d,\"hours\":%d,\"minutes\":%d,\"secs\":%d},", 
+                   (long)uptime_seconds, days, hours, minutes, seconds);
     
     // Network info
     pos += sprintf(json + pos, "\"network\":{\"hostname\":\"%s\",\"ip\":\"%s\"},", hostname, ip_address);
@@ -797,7 +936,7 @@ void serve_web_interface(int sock) {
 "    });\n"
 "}\n"
 "loadFiles();\n"
-"setInterval(loadSystemInfo, 1000);\n"
+"// Manual refresh only - no auto-refresh spam\n"
 "</script>\n"
 "</body>\n"
 "</html>";
@@ -1052,9 +1191,23 @@ void* client_thread(void* arg) {
     active_connections++;
     total_requests++;
     
-    // Set TCP_NODELAY to ensure responses are sent immediately
+    // Set socket options for better performance and stability
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    
+    // Set receive timeout (30 seconds)
+    struct timeval timeout;
+    timeout.tv_sec = 30;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    // Set send timeout (60 seconds for large files)
+    timeout.tv_sec = 60;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
+    // Prevent SIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
     
     char *buffer = malloc(BUFFER_SIZE);
     if (!buffer) {
@@ -1127,19 +1280,6 @@ void* client_thread(void* arg) {
 }
 
 int main() {
-    // Fork to background so elfldr can load other payloads
-    pid_t pid = fork();
-    if (pid > 0) {
-        // Parent process exits immediately
-        return 0;
-    }
-    if (pid < 0) {
-        // Fork failed, continue anyway
-    }
-    
-    // Child process continues as daemon
-    setsid();
-    
     int server_sock;
     struct sockaddr_in server_addr;
     
