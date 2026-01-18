@@ -156,6 +156,12 @@ Access from:
 - Directory listing with qsort() algorithm
 - Fallback mechanisms for all system calls
 
+#### 🐛 Bug Fixes
+- **Fixed Total Requests counter incrementing automatically** (removed setInterval spam)
+- **Fixed Uptime showing payload start time** instead of system boot time
+- **Fixed RAM showing hardcoded estimates** instead of real values
+- **Fixed file listing showing random order** instead of sorted
+
 #### 📊 Performance
 - **Download Speed**: 30-50% faster with sendfile()
 - **Buffer Size**: 1MB (16x improvement)
